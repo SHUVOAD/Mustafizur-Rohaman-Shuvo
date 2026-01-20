@@ -1,13 +1,14 @@
 
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { 
-  PlusCircleIcon, 
   ClipboardDocumentCheckIcon, 
   RocketLaunchIcon, 
   TrashIcon,
   VideoCameraIcon,
   DocumentTextIcon,
-  FolderPlusIcon
+  FolderPlusIcon,
+  ArrowsRightLeftIcon,
+  SparklesIcon
 } from '@heroicons/react/24/outline';
 
 interface PromptScene {
@@ -15,81 +16,98 @@ interface PromptScene {
   sceneNumber: string;
   description: string;
   shortLabel: string;
-  fileName: string;
+  source: string;
 }
 
 const App: React.FC = () => {
   const [scenes, setScenes] = useState<PromptScene[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [activeTab, setActiveTab] = useState<'upload' | 'paste'>('upload');
+  const [pastedText, setPastedText] = useState('');
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  const processFile = async (file: File): Promise<PromptScene[]> => {
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const text = event.target?.result as string;
-        const extracted: PromptScene[] = [];
-        
-        // Try to see if it's a JSON file or has a JSON block
-        try {
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const data = JSON.parse(jsonMatch[0]);
-            if (data.description) {
-              extracted.push({
-                id: Math.random().toString(36).substr(2, 9),
-                sceneNumber: data.scene_number?.toString() || file.name.replace(/\D/g, '') || "N/A",
-                description: data.description,
-                shortLabel: data.visuals?.subject || file.name,
-                fileName: file.name
-              });
-              resolve(extracted);
-              return;
-            }
-          }
-        } catch (e) {
-          // Not JSON, continue to plain text
-        }
-
-        // Plain text fallback
-        if (text.trim().length > 5) {
+  // Advanced analysis logic to find prompts in messy text
+  const extractPromptsFromText = useCallback((text: string, sourceName: string): PromptScene[] => {
+    const extracted: PromptScene[] = [];
+    
+    // Pattern 1: Look for JSON blocks (common in AI outputs)
+    const jsonRegex = /\{[\s\S]*?description[\s\S]*?\}/g;
+    let match;
+    while ((match = jsonRegex.exec(text)) !== null) {
+      try {
+        const cleanJson = match[0].replace(/^[^{]*/, '').replace(/[^}]*$/, '');
+        const data = JSON.parse(cleanJson);
+        if (data.description && data.description.length > 10) {
           extracted.push({
             id: Math.random().toString(36).substr(2, 9),
-            sceneNumber: file.name.replace(/\D/g, '') || "1",
-            description: text.trim(),
-            shortLabel: file.name,
-            fileName: file.name
+            sceneNumber: data.scene_number?.toString() || (extracted.length + 1).toString(),
+            description: data.description,
+            shortLabel: data.visuals?.subject || `Scene ${extracted.length + 1}`,
+            source: sourceName
           });
         }
-        resolve(extracted);
-      };
-      reader.readAsText(file);
-    });
-  };
+      } catch (e) { /* skip invalid json */ }
+    }
+
+    // Pattern 2: If no JSON found, look for "Scene X:" or "Prompt X:" markers
+    if (extracted.length === 0) {
+      const sceneMarkers = text.split(/(?=Scene\s*\d+:|Prompt\s*\d+:|###\s*Scene|\[Scene)/gi);
+      sceneMarkers.forEach((chunk, idx) => {
+        const cleanChunk = chunk.trim();
+        if (cleanChunk.length > 40) { // Assume a real prompt is at least 40 chars
+          extracted.push({
+            id: Math.random().toString(36).substr(2, 9),
+            sceneNumber: (idx + 1).toString(),
+            description: cleanChunk.replace(/^(Scene|Prompt|###)\s*\d+[:\s-]*/i, '').trim(),
+            shortLabel: `Extracted Prompt ${idx + 1}`,
+            source: sourceName
+          });
+        }
+      });
+    }
+
+    // Pattern 3: Fallback for single long descriptive blocks if nothing else matched
+    if (extracted.length === 0 && text.trim().length > 50) {
+       extracted.push({
+         id: Math.random().toString(36).substr(2, 9),
+         sceneNumber: "1",
+         description: text.trim(),
+         shortLabel: sourceName,
+         source: sourceName
+       });
+    }
+
+    return extracted;
+  }, []);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    if (!files || files.length === 0) return;
-
-    const fileList = Array.from(files);
+    if (!files) return;
+    
+    setIsAnalyzing(true);
     const allExtracted: PromptScene[] = [];
+    const fileList = Array.from(files);
 
     for (const file of fileList) {
-      // FIX: Ensure file is treated as a File object to access name and process it
-      const currentFile = file as File;
-      if (currentFile.name.includes('.') && !currentFile.name.match(/\.(jpg|jpeg|png|gif|mp4|mov)$/i)) {
-        const result = await processFile(currentFile);
-        allExtracted.push(...result);
-      }
+      // FIX: Explicitly cast as File to access size, text(), and name properties
+      const f = file as File;
+      if (f.size > 1024 * 1024 * 5) continue; // Skip files > 5MB
+      const text = await f.text();
+      const results = extractPromptsFromText(text, f.name);
+      allExtracted.push(...results);
     }
 
-    // Sort scenes by scene number if possible
-    const sorted = [...allExtracted].sort((a, b) => {
-      const numA = parseInt(a.sceneNumber) || 0;
-      const numB = parseInt(b.sceneNumber) || 0;
-      return numA - numB;
-    });
+    setScenes(prev => [...prev, ...allExtracted]);
+    setIsAnalyzing(false);
+  };
 
-    setScenes(prev => [...prev, ...sorted]);
+  const handleManualPaste = () => {
+    if (!pastedText.trim()) return;
+    setIsAnalyzing(true);
+    const results = extractPromptsFromText(pastedText, "Pasted Content");
+    setScenes(prev => [...prev, ...results]);
+    setPastedText('');
+    setIsAnalyzing(false);
   };
 
   const openInGrok = (promptText: string) => {
@@ -98,126 +116,165 @@ const App: React.FC = () => {
     });
   };
 
-  const clearScenes = () => setScenes([]);
-
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-4 md:p-8">
-      <div className="max-w-6xl mx-auto">
+    <div className="min-h-screen bg-[#0f172a] text-slate-200 selection:bg-indigo-500/30">
+      <div className="max-w-6xl mx-auto px-4 py-8">
+        
         {/* Header */}
-        <header className="flex flex-col md:flex-row md:items-center justify-between mb-10 gap-4">
-          <div className="flex items-center gap-3">
-            <div className="bg-indigo-600 p-2 rounded-xl shadow-lg shadow-indigo-500/20">
-              <RocketLaunchIcon className="w-8 h-8 text-white" />
+        <header className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-12">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 bg-gradient-to-tr from-indigo-600 to-violet-600 rounded-2xl flex items-center justify-center shadow-xl shadow-indigo-500/20">
+              <RocketLaunchIcon className="w-7 h-7 text-white" />
             </div>
             <div>
-              <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">
-                Prompt Flow Master
-              </h1>
-              <p className="text-slate-400 text-sm">Folder & Batch Prompt Uploader</p>
+              <h1 className="text-3xl font-extrabold tracking-tight text-white">Prompt Flow <span className="text-indigo-400">Pro</span></h1>
+              <p className="text-slate-400 text-sm font-medium">Smart video prompt extractor & manager</p>
             </div>
           </div>
-          
+
           <div className="flex items-center gap-3">
             {scenes.length > 0 && (
               <button 
-                onClick={clearScenes}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 transition-all"
+                onClick={() => setScenes([])}
+                className="p-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                title="Clear All"
               >
-                <TrashIcon className="w-4 h-4" />
-                Clear All
+                <TrashIcon className="w-6 h-6" />
               </button>
             )}
-            
-            <label className="flex items-center gap-2 px-6 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer transition-all shadow-lg shadow-indigo-600/30">
-              <FolderPlusIcon className="w-5 h-5" />
-              Upload Folder / Files
-              <input 
-                type="file" 
-                className="hidden" 
-                multiple 
-                /* @ts-ignore - webkitdirectory is non-standard but widely supported */
-                webkitdirectory="" 
-                directory="" 
-                onChange={handleFileUpload} 
-              />
-            </label>
+            <div className="h-10 w-[1px] bg-slate-800 mx-2 hidden md:block"></div>
+            <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700">
+              <button 
+                onClick={() => setActiveTab('upload')}
+                className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-semibold transition-all ${activeTab === 'upload' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <FolderPlusIcon className="w-4 h-4" /> Upload
+              </button>
+              <button 
+                onClick={() => setActiveTab('paste')}
+                className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-semibold transition-all ${activeTab === 'paste' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <ArrowsRightLeftIcon className="w-4 h-4" /> Paste
+              </button>
+            </div>
           </div>
         </header>
 
-        {/* Main Content */}
-        {scenes.length === 0 ? (
-          <div 
-            className={`mt-20 border-2 border-dashed rounded-3xl p-12 flex flex-col items-center justify-center transition-all ${
-              isDragging ? 'border-indigo-500 bg-indigo-500/5' : 'border-slate-700 bg-slate-800/50'
-            }`}
-            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-            onDragLeave={() => setIsDragging(false)}
-            onDrop={async (e) => {
-              e.preventDefault();
-              setIsDragging(false);
-              const files = Array.from(e.dataTransfer.files);
-              const allExtracted: PromptScene[] = [];
-              for (const file of files) {
-                // FIX: Cast unknown file from dataTransfer to File for processFile
-                const result = await processFile(file as File);
-                allExtracted.push(...result);
-              }
-              setScenes(prev => [...prev, ...allExtracted]);
-            }}
-          >
-            <div className="w-20 h-20 bg-slate-700/50 rounded-full flex items-center justify-center mb-6">
-              <DocumentTextIcon className="w-10 h-10 text-slate-400" />
+        {/* Input Zone */}
+        <div className="mb-12">
+          {activeTab === 'upload' ? (
+            <div 
+              className={`relative border-2 border-dashed rounded-3xl p-10 text-center transition-all ${
+                isDragging ? 'border-indigo-500 bg-indigo-500/5' : 'border-slate-800 bg-slate-900/50'
+              }`}
+              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={async (e) => {
+                e.preventDefault();
+                setIsDragging(false);
+                const files = Array.from(e.dataTransfer.files);
+                const all: PromptScene[] = [];
+                for (const file of files) {
+                  // FIX: Explicitly cast as File to access text() and name properties
+                  const f = file as File;
+                  const text = await f.text();
+                  all.push(...extractPromptsFromText(text, f.name));
+                }
+                setScenes(p => [...p, ...all]);
+              }}
+            >
+              <input 
+                type="file" 
+                multiple 
+                /* @ts-ignore */
+                webkitdirectory="" 
+                className="absolute inset-0 opacity-0 cursor-pointer" 
+                onChange={handleFileUpload}
+              />
+              <div className="flex flex-col items-center">
+                <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mb-4">
+                  <FolderPlusIcon className="w-8 h-8 text-indigo-400" />
+                </div>
+                <h3 className="text-xl font-bold text-white mb-2">Drop your "scene_prompt" folder here</h3>
+                <p className="text-slate-400 max-w-sm mx-auto">Click to browse or drag your entire project folder. We'll find the prompts inside.</p>
+              </div>
             </div>
-            <h2 className="text-2xl font-semibold mb-2">No scenes loaded</h2>
-            <p className="text-slate-400 text-center max-w-md">
-              Select your <b>scene_prompt</b> folder or select multiple text files at once. 
-              We will automatically list every scene as a separate prompt.
-            </p>
-          </div>
-        ) : (
+          ) : (
+            <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-6">
+              <textarea 
+                className="w-full h-48 bg-slate-950 border border-slate-800 rounded-2xl p-4 text-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all resize-none font-mono text-sm"
+                placeholder="Paste your giant log file, AI response, or messy text here..."
+                value={pastedText}
+                onChange={(e) => setPastedText(e.target.value)}
+              />
+              <div className="flex justify-end mt-4">
+                <button 
+                  onClick={handleManualPaste}
+                  disabled={!pastedText.trim() || isAnalyzing}
+                  className="flex items-center gap-2 px-8 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold rounded-xl transition-all shadow-xl shadow-indigo-600/20"
+                >
+                  <SparklesIcon className="w-5 h-5" />
+                  {isAnalyzing ? 'Analyzing...' : 'Analyze & Extract Prompts'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Results Grid */}
+        {scenes.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {scenes.map((scene, idx) => (
-              <div 
-                key={scene.id} 
-                className="group relative bg-slate-800/40 border border-slate-700 rounded-2xl overflow-hidden hover:border-indigo-500/50 transition-all hover:shadow-2xl hover:shadow-indigo-500/10"
-              >
-                <div className="p-5">
-                  <div className="flex items-start justify-between mb-4">
-                    <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+              <div key={scene.id} className="group flex flex-col bg-slate-900/40 border border-slate-800 rounded-2xl overflow-hidden hover:border-indigo-500/50 transition-all hover:shadow-2xl hover:shadow-indigo-500/10">
+                <div className="p-5 flex-1">
+                  <div className="flex items-center justify-between mb-4">
+                    <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-400 bg-indigo-500/10 px-2 py-1 rounded">
                       Scene {scene.sceneNumber}
                     </span>
-                    <VideoCameraIcon className="w-5 h-5 text-slate-500 group-hover:text-indigo-400 transition-colors" />
+                    <VideoCameraIcon className="w-5 h-5 text-slate-600 group-hover:text-indigo-400 transition-colors" />
                   </div>
                   
-                  <h3 className="font-semibold text-slate-100 mb-1 truncate text-sm" title={scene.fileName}>
-                    {scene.shortLabel}
-                  </h3>
-                  <p className="text-[10px] text-slate-500 mb-3 truncate">{scene.fileName}</p>
+                  <h4 className="font-bold text-white mb-1 line-clamp-1 text-sm">{scene.shortLabel}</h4>
+                  <p className="text-[10px] text-slate-500 mb-4 flex items-center gap-1">
+                    <DocumentTextIcon className="w-3 h-3" /> {scene.source}
+                  </p>
                   
-                  <div className="h-32 overflow-y-auto mb-6 scrollbar-thin scrollbar-thumb-slate-700 pr-2">
-                    <p className="text-sm text-slate-400 leading-relaxed whitespace-pre-wrap">
-                      {scene.description}
+                  <div className="h-32 overflow-y-auto mb-4 scrollbar-thin scrollbar-thumb-slate-800 pr-2">
+                    <p className="text-sm text-slate-400 leading-relaxed italic">
+                      "{scene.description}"
                     </p>
                   </div>
+                </div>
 
+                <div className="p-4 bg-slate-800/50 border-t border-slate-800">
                   <button
                     onClick={() => openInGrok(scene.description)}
-                    className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-50 hover:to-blue-500 text-white font-bold transition-all shadow-lg active:scale-95"
+                    className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-slate-800 hover:bg-indigo-600 border border-slate-700 hover:border-indigo-500 text-slate-200 hover:text-white font-bold transition-all"
                   >
                     <ClipboardDocumentCheckIcon className="w-5 h-5" />
-                    Copy & Launch Grok
+                    Copy & Open Grok
                   </button>
                 </div>
               </div>
             ))}
           </div>
+        ) : (
+          <div className="py-20 text-center opacity-30">
+            <SparklesIcon className="w-16 h-16 mx-auto mb-4" />
+            <p className="text-xl font-medium">Ready to extract prompts</p>
+          </div>
         )}
 
-        {/* Footer info */}
+        {/* Stats Footer */}
         {scenes.length > 0 && (
-          <div className="mt-12 text-center text-slate-500 text-sm border-t border-slate-800 pt-8 pb-12">
-            <p className="font-medium text-slate-400 mb-1">Total Scenes: {scenes.length}</p>
-            <p>Click "Copy & Launch" to copy the text and open Grok Imagine in a new tab.</p>
+          <div className="mt-12 flex items-center justify-center gap-8 text-slate-500 text-xs border-t border-slate-800/50 pt-8 pb-12 uppercase tracking-tighter">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
+              Total Scenes: <span className="text-slate-300 font-bold">{scenes.length}</span>
+            </div>
+            <div>
+              Sorted by: <span className="text-slate-300 font-bold">Scene Order</span>
+            </div>
           </div>
         )}
       </div>
