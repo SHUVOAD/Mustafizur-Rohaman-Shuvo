@@ -1,0 +1,5 @@
+{
+  "name": "Prompt Flow Master",
+  "description": "Upload prompt files and quickly launch them in Grok Imagine with a single click to streamline your video generation workflow.",
+  "requestFramePermissions": []
+}
