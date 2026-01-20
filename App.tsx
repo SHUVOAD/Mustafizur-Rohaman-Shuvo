@@ -26,58 +26,90 @@ const App: React.FC = () => {
   const [pastedText, setPastedText] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  // Advanced analysis logic to find prompts in messy text
   const extractPromptsFromText = useCallback((text: string, sourceName: string): PromptScene[] => {
-    const extracted: PromptScene[] = [];
+    let extracted: PromptScene[] = [];
     
-    // Pattern 1: Look for JSON blocks (common in AI outputs)
-    const jsonRegex = /\{[\s\S]*?description[\s\S]*?\}/g;
+    // 1. Check for JSON first as it's the most structured
+    const jsonRegex = /({[\s\S]*?description[\s\S]*?})|(\[[\s\S]*?description[\s\S]*?\])/g;
     let match;
     while ((match = jsonRegex.exec(text)) !== null) {
       try {
-        const cleanJson = match[0].replace(/^[^{]*/, '').replace(/[^}]*$/, '');
-        const data = JSON.parse(cleanJson);
-        if (data.description && data.description.length > 10) {
+        const potentialJson = match[0];
+        const data = JSON.parse(potentialJson);
+        const items = Array.isArray(data) ? data : [data];
+        items.forEach((item: any) => {
+          if (item.description && item.description.length > 10) {
+            extracted.push({
+              id: Math.random().toString(36).substr(2, 9),
+              sceneNumber: item.scene_number?.toString() || (extracted.length + 1).toString(),
+              description: item.description,
+              shortLabel: item.visuals?.subject || item.title || `Scene ${extracted.length + 1}`,
+              source: sourceName
+            });
+          }
+        });
+      } catch (e) { }
+    }
+
+    if (extracted.length > 0) return extracted;
+
+    // 2. Advanced Multi-line / Header Parsing
+    // Split by markers like "Scene 1", "### 1.", "Prompt 1:", etc.
+    const splitRegex = /(?=Scene\s*\d+[:\s-]*|Prompt\s*\d+[:\s-]*|###\s*\**\d+[\.\s]|\[Scene\s*\d+\])/gi;
+    let chunks = text.split(splitRegex);
+
+    // If no markers found, try double-newline splitting
+    if (chunks.length <= 1) {
+      chunks = text.split(/\n\s*\n/);
+    }
+
+    chunks.forEach((chunk) => {
+      let cleanChunk = chunk.trim();
+      
+      // FILTER: Ignore "Conversational Filler" from AI (e.g., "Got it!", "Here are your prompts...")
+      const isConversational = /^(Got it|Here are|Below are|Sure|Certainly|I've written|The following)/i.test(cleanChunk);
+      if (isConversational && cleanChunk.length < 200) return;
+
+      if (cleanChunk.length > 30) {
+        // Extract scene number if present in header (e.g., "### **1. Title" -> "1")
+        const numMatch = cleanChunk.match(/(?:Scene|Prompt|###\s*\**|\[Scene)\s*(\d+)/i);
+        const sceneNum = numMatch ? numMatch[1] : (extracted.length + 1).toString();
+
+        // CLEANUP: Remove common header markers from the text content
+        let finalDescription = cleanChunk
+          .replace(/^(Scene|Prompt|###)\s*\**\d+[\.\s-]*\**[:\s-]*/i, '') // Remove "Scene 1:"
+          .replace(/^\**[^*]+\**\s*[-—]\s*/, '') // Remove "Title - " prefixes
+          .trim();
+
+        // If after cleaning we have a meaningful description
+        if (finalDescription.length > 15) {
           extracted.push({
             id: Math.random().toString(36).substr(2, 9),
-            sceneNumber: data.scene_number?.toString() || (extracted.length + 1).toString(),
-            description: data.description,
-            shortLabel: data.visuals?.subject || `Scene ${extracted.length + 1}`,
+            sceneNumber: sceneNum,
+            description: finalDescription,
+            shortLabel: finalDescription.substring(0, 40) + "...",
             source: sourceName
           });
         }
-      } catch (e) { /* skip invalid json */ }
+      }
+    });
+
+    // 3. De-duplication / Merging
+    // Sometimes a Title and a Description are separated. Let's merge tiny "Title" scenes into the next scene.
+    const merged: PromptScene[] = [];
+    for (let i = 0; i < extracted.length; i++) {
+      const current = extracted[i];
+      // If this scene is very short and the next one exists, it might be a title for the next
+      if (current.description.length < 60 && i < extracted.length - 1) {
+        const next = extracted[i + 1];
+        next.description = `[${current.description}]\n${next.description}`;
+        // Skip current, it's now merged
+      } else {
+        merged.push(current);
+      }
     }
 
-    // Pattern 2: If no JSON found, look for "Scene X:" or "Prompt X:" markers
-    if (extracted.length === 0) {
-      const sceneMarkers = text.split(/(?=Scene\s*\d+:|Prompt\s*\d+:|###\s*Scene|\[Scene)/gi);
-      sceneMarkers.forEach((chunk, idx) => {
-        const cleanChunk = chunk.trim();
-        if (cleanChunk.length > 40) { // Assume a real prompt is at least 40 chars
-          extracted.push({
-            id: Math.random().toString(36).substr(2, 9),
-            sceneNumber: (idx + 1).toString(),
-            description: cleanChunk.replace(/^(Scene|Prompt|###)\s*\d+[:\s-]*/i, '').trim(),
-            shortLabel: `Extracted Prompt ${idx + 1}`,
-            source: sourceName
-          });
-        }
-      });
-    }
-
-    // Pattern 3: Fallback for single long descriptive blocks if nothing else matched
-    if (extracted.length === 0 && text.trim().length > 50) {
-       extracted.push({
-         id: Math.random().toString(36).substr(2, 9),
-         sceneNumber: "1",
-         description: text.trim(),
-         shortLabel: sourceName,
-         source: sourceName
-       });
-    }
-
-    return extracted;
+    return merged.length > 0 ? merged : extracted;
   }, []);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -89,9 +121,8 @@ const App: React.FC = () => {
     const fileList = Array.from(files);
 
     for (const file of fileList) {
-      // FIX: Explicitly cast as File to access size, text(), and name properties
       const f = file as File;
-      if (f.size > 1024 * 1024 * 5) continue; // Skip files > 5MB
+      if (f.size > 1024 * 1024 * 5) continue;
       const text = await f.text();
       const results = extractPromptsFromText(text, f.name);
       allExtracted.push(...results);
@@ -117,18 +148,18 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-[#0f172a] text-slate-200 selection:bg-indigo-500/30">
+    <div className="min-h-screen bg-[#0b0f1a] text-slate-200 selection:bg-indigo-500/30">
       <div className="max-w-6xl mx-auto px-4 py-8">
         
         {/* Header */}
         <header className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-12">
           <div className="flex items-center gap-4">
-            <div className="w-12 h-12 bg-gradient-to-tr from-indigo-600 to-violet-600 rounded-2xl flex items-center justify-center shadow-xl shadow-indigo-500/20">
+            <div className="w-12 h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center shadow-2xl shadow-indigo-500/20">
               <RocketLaunchIcon className="w-7 h-7 text-white" />
             </div>
             <div>
-              <h1 className="text-3xl font-extrabold tracking-tight text-white">Prompt Flow <span className="text-indigo-400">Pro</span></h1>
-              <p className="text-slate-400 text-sm font-medium">Smart video prompt extractor & manager</p>
+              <h1 className="text-3xl font-black tracking-tight text-white uppercase italic">Prompt<span className="text-indigo-500">Flow</span></h1>
+              <p className="text-slate-500 text-xs font-bold tracking-widest uppercase">Video Scene Organizer</p>
             </div>
           </div>
 
@@ -136,23 +167,23 @@ const App: React.FC = () => {
             {scenes.length > 0 && (
               <button 
                 onClick={() => setScenes([])}
-                className="p-2.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-400 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                className="group flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/5 border border-red-500/10 text-red-500/70 hover:bg-red-500/10 hover:text-red-400 transition-all"
                 title="Clear All"
               >
-                <TrashIcon className="w-6 h-6" />
+                <TrashIcon className="w-4 h-4" />
+                <span className="text-xs font-bold uppercase">Clear</span>
               </button>
             )}
-            <div className="h-10 w-[1px] bg-slate-800 mx-2 hidden md:block"></div>
-            <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700">
+            <div className="flex bg-slate-900/80 p-1 rounded-xl border border-slate-800">
               <button 
                 onClick={() => setActiveTab('upload')}
-                className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-semibold transition-all ${activeTab === 'upload' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
+                className={`flex items-center gap-2 px-5 py-2 rounded-lg text-xs font-bold uppercase transition-all ${activeTab === 'upload' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
               >
-                <FolderPlusIcon className="w-4 h-4" /> Upload
+                <FolderPlusIcon className="w-4 h-4" /> Files
               </button>
               <button 
                 onClick={() => setActiveTab('paste')}
-                className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-semibold transition-all ${activeTab === 'paste' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
+                className={`flex items-center gap-2 px-5 py-2 rounded-lg text-xs font-bold uppercase transition-all ${activeTab === 'paste' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
               >
                 <ArrowsRightLeftIcon className="w-4 h-4" /> Paste
               </button>
@@ -161,11 +192,11 @@ const App: React.FC = () => {
         </header>
 
         {/* Input Zone */}
-        <div className="mb-12">
+        <div className="mb-10">
           {activeTab === 'upload' ? (
             <div 
-              className={`relative border-2 border-dashed rounded-3xl p-10 text-center transition-all ${
-                isDragging ? 'border-indigo-500 bg-indigo-500/5' : 'border-slate-800 bg-slate-900/50'
+              className={`relative border-2 border-dashed rounded-[2rem] p-12 text-center transition-all ${
+                isDragging ? 'border-indigo-500 bg-indigo-500/5 scale-[0.99]' : 'border-slate-800 bg-slate-900/30'
               }`}
               onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={() => setIsDragging(false)}
@@ -175,7 +206,6 @@ const App: React.FC = () => {
                 const files = Array.from(e.dataTransfer.files);
                 const all: PromptScene[] = [];
                 for (const file of files) {
-                  // FIX: Explicitly cast as File to access text() and name properties
                   const f = file as File;
                   const text = await f.text();
                   all.push(...extractPromptsFromText(text, f.name));
@@ -192,29 +222,33 @@ const App: React.FC = () => {
                 onChange={handleFileUpload}
               />
               <div className="flex flex-col items-center">
-                <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mb-4">
-                  <FolderPlusIcon className="w-8 h-8 text-indigo-400" />
+                <div className="w-20 h-20 bg-slate-900 rounded-3xl flex items-center justify-center mb-6 border border-slate-800 shadow-inner">
+                  <FolderPlusIcon className="w-10 h-10 text-indigo-500" />
                 </div>
-                <h3 className="text-xl font-bold text-white mb-2">Drop your "scene_prompt" folder here</h3>
-                <p className="text-slate-400 max-w-sm mx-auto">Click to browse or drag your entire project folder. We'll find the prompts inside.</p>
+                <h3 className="text-xl font-bold text-white mb-2">Upload Scene Folder</h3>
+                <p className="text-slate-500 text-sm max-w-xs mx-auto">Drag your prompts folder here. We'll extract and organize every scene automatically.</p>
               </div>
             </div>
           ) : (
-            <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-6">
+            <div className="bg-slate-900/30 border border-slate-800 rounded-[2rem] p-6 shadow-2xl relative overflow-hidden">
+              <div className="absolute top-0 left-0 w-1 h-full bg-indigo-600"></div>
               <textarea 
-                className="w-full h-48 bg-slate-950 border border-slate-800 rounded-2xl p-4 text-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all resize-none font-mono text-sm"
-                placeholder="Paste your giant log file, AI response, or messy text here..."
+                className="w-full h-64 bg-transparent border-none p-4 text-slate-300 focus:outline-none transition-all resize-none font-mono text-sm leading-relaxed"
+                placeholder="Paste your raw AI text here... Header and filler text will be automatically removed."
                 value={pastedText}
                 onChange={(e) => setPastedText(e.target.value)}
               />
-              <div className="flex justify-end mt-4">
+              <div className="flex justify-between items-center mt-4 pt-4 border-t border-slate-800/50">
+                <div className="flex items-center gap-2 text-indigo-500/50">
+                   <SparklesIcon className="w-4 h-4" />
+                   <span className="text-[10px] font-bold uppercase tracking-widest">Smart Extraction Active</span>
+                </div>
                 <button 
                   onClick={handleManualPaste}
                   disabled={!pastedText.trim() || isAnalyzing}
-                  className="flex items-center gap-2 px-8 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold rounded-xl transition-all shadow-xl shadow-indigo-600/20"
+                  className="flex items-center gap-2 px-10 py-3.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-black uppercase text-xs tracking-widest rounded-xl transition-all shadow-xl shadow-indigo-600/20 active:scale-95"
                 >
-                  <SparklesIcon className="w-5 h-5" />
-                  {isAnalyzing ? 'Analyzing...' : 'Analyze & Extract Prompts'}
+                  {isAnalyzing ? 'Analyzing...' : 'Generate Scene List'}
                 </button>
               </div>
             </div>
@@ -223,58 +257,59 @@ const App: React.FC = () => {
 
         {/* Results Grid */}
         {scenes.length > 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
             {scenes.map((scene, idx) => (
-              <div key={scene.id} className="group flex flex-col bg-slate-900/40 border border-slate-800 rounded-2xl overflow-hidden hover:border-indigo-500/50 transition-all hover:shadow-2xl hover:shadow-indigo-500/10">
-                <div className="p-5 flex-1">
-                  <div className="flex items-center justify-between mb-4">
-                    <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-400 bg-indigo-500/10 px-2 py-1 rounded">
-                      Scene {scene.sceneNumber}
-                    </span>
-                    <VideoCameraIcon className="w-5 h-5 text-slate-600 group-hover:text-indigo-400 transition-colors" />
+              <div key={scene.id} className="group flex flex-col bg-[#161b2a] border border-slate-800/60 rounded-[1.5rem] overflow-hidden hover:border-indigo-500/40 transition-all duration-300 hover:shadow-2xl hover:shadow-indigo-900/20">
+                <div className="p-6 flex-1">
+                  <div className="flex items-center justify-between mb-5">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
+                      <span className="text-[11px] font-black uppercase tracking-widest text-indigo-400">
+                        Scene {scene.sceneNumber}
+                      </span>
+                    </div>
+                    <VideoCameraIcon className="w-5 h-5 text-slate-700 group-hover:text-indigo-500 transition-colors" />
                   </div>
                   
-                  <h4 className="font-bold text-white mb-1 line-clamp-1 text-sm">{scene.shortLabel}</h4>
-                  <p className="text-[10px] text-slate-500 mb-4 flex items-center gap-1">
-                    <DocumentTextIcon className="w-3 h-3" /> {scene.source}
-                  </p>
-                  
-                  <div className="h-32 overflow-y-auto mb-4 scrollbar-thin scrollbar-thumb-slate-800 pr-2">
-                    <p className="text-sm text-slate-400 leading-relaxed italic">
-                      "{scene.description}"
+                  <div className="h-44 overflow-y-auto mb-6 scrollbar-thin scrollbar-thumb-slate-800 pr-3">
+                    <p className="text-[14px] text-slate-300 leading-relaxed font-medium">
+                      {scene.description}
                     </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 text-[9px] font-bold text-slate-600 uppercase tracking-tight">
+                    <DocumentTextIcon className="w-3 h-3" />
+                    <span className="truncate">{scene.source}</span>
                   </div>
                 </div>
 
-                <div className="p-4 bg-slate-800/50 border-t border-slate-800">
+                <div className="p-4 bg-slate-900/50 border-t border-slate-800/40">
                   <button
                     onClick={() => openInGrok(scene.description)}
-                    className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-slate-800 hover:bg-indigo-600 border border-slate-700 hover:border-indigo-500 text-slate-200 hover:text-white font-bold transition-all"
+                    className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl bg-slate-800/50 hover:bg-indigo-600 border border-slate-700 hover:border-indigo-500 text-slate-300 hover:text-white font-black uppercase text-[10px] tracking-[0.2em] transition-all duration-200 active:scale-95"
                   >
-                    <ClipboardDocumentCheckIcon className="w-5 h-5" />
-                    Copy & Open Grok
+                    <ClipboardDocumentCheckIcon className="w-4 h-4" />
+                    Copy & Launch
                   </button>
                 </div>
               </div>
             ))}
           </div>
         ) : (
-          <div className="py-20 text-center opacity-30">
-            <SparklesIcon className="w-16 h-16 mx-auto mb-4" />
-            <p className="text-xl font-medium">Ready to extract prompts</p>
+          <div className="py-32 text-center opacity-20">
+            <div className="inline-block p-10 border-2 border-slate-800 rounded-full mb-6">
+               <VideoCameraIcon className="w-16 h-16 text-slate-500" />
+            </div>
+            <p className="text-xl font-black uppercase tracking-[0.3em] text-slate-400">No Scenes Loaded</p>
           </div>
         )}
 
-        {/* Stats Footer */}
+        {/* Footer info */}
         {scenes.length > 0 && (
-          <div className="mt-12 flex items-center justify-center gap-8 text-slate-500 text-xs border-t border-slate-800/50 pt-8 pb-12 uppercase tracking-tighter">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
-              Total Scenes: <span className="text-slate-300 font-bold">{scenes.length}</span>
-            </div>
-            <div>
-              Sorted by: <span className="text-slate-300 font-bold">Scene Order</span>
-            </div>
+          <div className="mt-20 text-center border-t border-slate-900 pt-10 pb-20">
+            <p className="text-[10px] font-black uppercase tracking-[0.4em] text-slate-600">
+              Flow Complete &bull; {scenes.length} Scenes Found
+            </p>
           </div>
         )}
       </div>
