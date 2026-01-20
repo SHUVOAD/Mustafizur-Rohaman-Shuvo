@@ -5,7 +5,8 @@ import {
   RocketLaunchIcon, 
   TrashIcon,
   VideoCameraIcon,
-  DocumentTextIcon
+  DocumentTextIcon,
+  FolderPlusIcon
 } from '@heroicons/react/24/outline';
 
 export {
@@ -14,5 +15,6 @@ export {
   RocketLaunchIcon,
   TrashIcon,
   VideoCameraIcon,
-  DocumentTextIcon
+  DocumentTextIcon,
+  FolderPlusIcon
 };
